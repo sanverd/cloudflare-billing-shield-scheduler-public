@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { createCloudflareCollector, runCollector, shouldRunFullInventory } from "../src/collector";
+import { runCollector, shouldRunFullInventory } from "../src/collector";
 
 function getRequestInit(fetchMock: ReturnType<typeof vi.fn>): RequestInit {
   const call = fetchMock.mock.calls[0] as [RequestInfo | URL, RequestInit?] | undefined;
@@ -37,6 +37,12 @@ describe("scheduler cadence", () => {
       );
     });
     const collectPricingInputs = vi.fn(async () => []);
+    const collectResourceUsageTotals = vi.fn(async () => ({
+      d1RowsUsed: 4200,
+      pagesFunctionsRequests: 265,
+      r2OperationsUsed: 18,
+    }));
+    const collectWorkerRequests = vi.fn(async () => 702);
     const listCurrentResources = vi.fn(async () => [
       { id: "worker:api", type: "worker" as const },
     ]);
@@ -46,6 +52,8 @@ describe("scheduler cadence", () => {
     await runCollector("2026-03-03T10:07:00Z", {
       cloudflare: {
         collectPricingInputs,
+        collectResourceUsageTotals,
+        collectWorkerRequests,
         listCurrentResources,
         reconcileInventory,
       },
@@ -59,6 +67,8 @@ describe("scheduler cadence", () => {
     });
 
     expect(collectPricingInputs).toHaveBeenCalledOnce();
+    expect(collectResourceUsageTotals).toHaveBeenCalledOnce();
+    expect(collectWorkerRequests).toHaveBeenCalledOnce();
     expect(listCurrentResources).toHaveBeenCalledOnce();
     expect(reconcileInventory).not.toHaveBeenCalled();
     expect(fetchMock).toHaveBeenCalledOnce();
@@ -73,9 +83,14 @@ describe("scheduler cadence", () => {
     });
     expect(JSON.parse(String(requestInit.body))).toMatchObject({
       elapsedSeconds: 120,
+      d1RowsUsed: 4200,
+      pagesFunctionsRequests: 265,
       periodStart: "2026-03-03T10:05:00.000Z",
       pricingInputs: [],
+      r2OperationsUsed: 18,
       resources: [{ id: "worker:api", type: "worker" }],
+      workerBilledUsd: 0,
+      workerRequests: 702,
     });
     expect(snapshotStore.save).toHaveBeenCalledWith([
       { id: "worker:api", type: "worker" },
@@ -105,6 +120,12 @@ describe("scheduler cadence", () => {
     await runCollector("2026-03-03T11:00:00Z", {
       cloudflare: {
         collectPricingInputs: vi.fn(async () => []),
+        collectResourceUsageTotals: vi.fn(async () => ({
+          d1RowsUsed: 3200,
+          pagesFunctionsRequests: 111,
+          r2OperationsUsed: 9,
+        })),
+        collectWorkerRequests: vi.fn(async () => 550),
         listCurrentResources,
         reconcileInventory,
       },
@@ -125,6 +146,11 @@ describe("scheduler cadence", () => {
         { id: "worker:api", type: "worker" },
         { id: "r2:assets", type: "r2" },
       ],
+      d1RowsUsed: 3200,
+      pagesFunctionsRequests: 111,
+      r2OperationsUsed: 9,
+      workerBilledUsd: 0,
+      workerRequests: 550,
     });
   });
 
@@ -148,6 +174,12 @@ describe("scheduler cadence", () => {
     await runCollector("2026-03-03T10:07:00Z", {
       cloudflare: {
         collectPricingInputs: vi.fn(async () => []),
+        collectResourceUsageTotals: vi.fn(async () => ({
+          d1RowsUsed: 0,
+          pagesFunctionsRequests: 0,
+          r2OperationsUsed: 0,
+        })),
+        collectWorkerRequests: vi.fn(async () => 0),
         listCurrentResources: vi.fn(async () => [{ id: "r2:assets", type: "r2" as const }]),
         reconcileInventory: vi.fn(async () => []),
       },
@@ -168,41 +200,5 @@ describe("scheduler cadence", () => {
     expect(snapshotStore.save).toHaveBeenCalledWith([
       { id: "r2:assets", type: "r2" },
     ]);
-  });
-
-  it("falls back to empty pricing inputs when GraphQL analytics filters are unsupported", async () => {
-    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
-      if (String(input) === "https://api.cloudflare.com/client/v4/graphql") {
-        return new Response(
-          JSON.stringify({
-            data: null,
-            errors: [
-              {
-                message:
-                  'error parsing args for "d1AnalyticsAdaptiveGroups": filter: unknown arg datetime_lt',
-              },
-            ],
-          }),
-          { status: 200 },
-        );
-      }
-
-      throw new Error(`Unexpected URL: ${String(input)}`);
-    });
-    const collector = createCloudflareCollector(
-      {
-        accountId: "account-id",
-        apiToken: "api-token",
-        ingestUrl: "https://private.example.com/api/ingest",
-        serviceTokenId: "token-id",
-        serviceTokenSecret: "token-secret",
-      },
-      fetchMock as typeof fetch,
-    );
-
-    const pricingInputs = await collector.collectPricingInputs("2026-03-05T10:50:00Z");
-
-    expect(pricingInputs).toEqual([]);
-    expect(fetchMock).toHaveBeenCalledOnce();
   });
 });

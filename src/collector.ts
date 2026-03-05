@@ -48,15 +48,28 @@ export type PricingInput =
   | WorkersPricingInput;
 
 export interface IngestPayload {
+  d1RowsUsed?: number;
   elapsedSeconds: number;
+  pagesFunctionsRequests?: number;
   periodStart: string;
   pricingInputs: PricingInput[];
+  r2OperationsUsed?: number;
   resources: SchedulerResource[];
   totalSecondsInPeriod: number;
+  workerBilledUsd?: number;
+  workerRequests?: number;
+}
+
+export interface ResourceUsageTotals {
+  d1RowsUsed: number;
+  pagesFunctionsRequests: number;
+  r2OperationsUsed: number;
 }
 
 export interface CloudflareCollectorClient {
   collectPricingInputs(timestamp: string): Promise<PricingInput[]>;
+  collectResourceUsageTotals(timestamp: string): Promise<ResourceUsageTotals>;
+  collectWorkerRequests(timestamp: string): Promise<number>;
   listCurrentResources(timestamp: string): Promise<SchedulerResource[]>;
   reconcileInventory(timestamp: string): Promise<SchedulerResource[]>;
 }
@@ -126,6 +139,7 @@ const DEFAULT_PRICING = {
     usdPerMillionRequests: 0.3,
   },
 } as const;
+const SHARED_REQUESTS_FREE_PER_DAY = 100_000;
 
 function getRequiredEnv(name: string): string {
   const value = process.env[name];
@@ -177,6 +191,14 @@ export function getCollectionWindow(timestamp: string): CollectionWindow {
     totalSecondsInPeriod: getSecondsInUtcMonth(timestamp),
     windowEnd: end.toISOString(),
   };
+}
+
+function getUtcDayStart(timestamp: string): string {
+  const date = normalizeTimestamp(timestamp);
+
+  return new Date(
+    Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), 0, 0, 0, 0),
+  ).toISOString();
 }
 
 function getSecondsInUtcMonth(timestamp: string): number {
@@ -318,6 +340,7 @@ export async function runCollector(
   const fetchFn = dependencies.fetchFn ?? fetch;
   const window = getCollectionWindow(timestamp);
   const pricingInputs = await dependencies.cloudflare.collectPricingInputs(timestamp);
+  const resourceUsageTotals = await dependencies.cloudflare.collectResourceUsageTotals(timestamp);
   const previousSnapshot = dedupeResources(await dependencies.snapshotStore?.load?.() ?? []);
   const fullInventoryRun = shouldRunFullInventory(timestamp);
   const currentResources = fullInventoryRun
@@ -326,17 +349,28 @@ export async function runCollector(
   const resources = fullInventoryRun
     ? currentResources
     : diffResourceSnapshots(previousSnapshot, currentResources);
+  const workerRequests = await dependencies.cloudflare.collectWorkerRequests(timestamp);
+  const workerBilledUsd = Math.max(
+    (Math.max(workerRequests - SHARED_REQUESTS_FREE_PER_DAY, 0) / 1_000_000) *
+      DEFAULT_PRICING.workers.usdPerMillionRequests,
+    0,
+  );
   const nextSnapshot = currentResources;
 
   if (dependencies.snapshotStore) {
     await dependencies.snapshotStore.save(nextSnapshot);
   }
   const payload: IngestPayload = {
+    d1RowsUsed: resourceUsageTotals.d1RowsUsed,
     elapsedSeconds: window.elapsedSeconds,
+    pagesFunctionsRequests: resourceUsageTotals.pagesFunctionsRequests,
     periodStart: window.periodStart,
     pricingInputs,
+    r2OperationsUsed: resourceUsageTotals.r2OperationsUsed,
     resources: dedupeResources(resources),
     totalSecondsInPeriod: window.totalSecondsInPeriod,
+    workerBilledUsd,
+    workerRequests,
   };
 
   const response = await fetchFn(dependencies.ingest.url, {
@@ -462,15 +496,16 @@ export function createCloudflareCollector(
 
   async function collectPricingInputs(timestamp: string): Promise<PricingInput[]> {
     const window = getCollectionWindow(timestamp);
-    let data: {
+
+    const data = await graphql<{
       viewer: {
         accounts: Array<{
           d1StorageGroups?: Array<{
-            dimensions?: { databaseName?: string };
+            dimensions?: { databaseId?: string };
             max?: { databaseSizeBytes?: number | null };
           }>;
           d1UsageGroups?: Array<{
-            dimensions?: { databaseName?: string };
+            dimensions?: { databaseId?: string };
             sum?: { rowsRead?: number | null; rowsWritten?: number | null };
           }>;
           r2OperationGroups?: Array<{
@@ -480,102 +515,84 @@ export function createCloudflareCollector(
           r2StorageGroups?: Array<{
             max?: { metadataSize?: number | null; payloadSize?: number | null };
           }>;
+          pagesFunctionsGroups?: Array<{ sum?: { requests?: number | null } }>;
           workerGroups?: Array<{ sum?: { requests?: number | null } }>;
         }>;
       };
-    };
-
-    try {
-      data = await graphql<{
-        viewer: {
-          accounts: Array<{
-            d1StorageGroups?: Array<{
-              dimensions?: { databaseName?: string };
-              max?: { databaseSizeBytes?: number | null };
-            }>;
-            d1UsageGroups?: Array<{
-              dimensions?: { databaseName?: string };
-              sum?: { rowsRead?: number | null; rowsWritten?: number | null };
-            }>;
-            r2OperationGroups?: Array<{
-              dimensions?: { actionType?: string | null };
-              sum?: { requests?: number | null };
-            }>;
-            r2StorageGroups?: Array<{
-              max?: { metadataSize?: number | null; payloadSize?: number | null };
-            }>;
-            workerGroups?: Array<{ sum?: { requests?: number | null } }>;
-          }>;
-        };
-      }>(
-        `
-          query BillingShieldWindow($accountTag: string!, $start: Time!, $end: Time!) {
-            viewer {
-              accounts(filter: { accountTag: $accountTag }) {
-                workerGroups: workersInvocationsAdaptive(
-                  limit: 1
-                  filter: { datetime_geq: $start, datetime_lt: $end }
-                ) {
-                  sum {
-                    requests
-                  }
+    }>(
+      `
+        query BillingShieldWindow($accountTag: string!, $start: Time!, $end: Time!) {
+          viewer {
+            accounts(filter: { accountTag: $accountTag }) {
+              workerGroups: workersInvocationsAdaptive(
+                limit: 288
+                filter: { datetime_geq: $start, datetime_lt: $end }
+              ) {
+                sum {
+                  requests
                 }
-                d1UsageGroups: d1AnalyticsAdaptiveGroups(
-                  filter: { datetime_geq: $start, datetime_lt: $end }
-                  limit: 100
-                ) {
-                  dimensions {
-                    databaseName
-                  }
-                  sum {
-                    rowsRead
-                    rowsWritten
-                  }
+              }
+              pagesFunctionsGroups: pagesFunctionsInvocationsAdaptiveGroups(
+                limit: 288
+                filter: { datetime_geq: $start, datetime_lt: $end }
+              ) {
+                sum {
+                  requests
                 }
-                d1StorageGroups: d1StorageAdaptiveGroups(limit: 100) {
-                  dimensions {
-                    databaseName
-                  }
-                  max {
-                    databaseSizeBytes
-                  }
+              }
+              d1UsageGroups: d1AnalyticsAdaptiveGroups(
+                filter: { datetimeFiveMinutes_geq: $start, datetimeFiveMinutes_lt: $end }
+                limit: 100
+              ) {
+                dimensions {
+                  databaseId
                 }
-                r2OperationGroups: r2OperationsAdaptiveGroups(
-                  filter: { datetime_geq: $start, datetime_lt: $end }
-                  limit: 100
-                ) {
-                  dimensions {
-                    actionType
-                  }
-                  sum {
-                    requests
-                  }
+                sum {
+                  rowsRead
+                  rowsWritten
                 }
-                r2StorageGroups: r2StorageAdaptiveGroups(limit: 100) {
-                  max {
-                    metadataSize
-                    payloadSize
-                  }
+              }
+              d1StorageGroups: d1StorageAdaptiveGroups(
+                filter: { datetimeFiveMinutes_geq: $start, datetimeFiveMinutes_lt: $end }
+                limit: 100
+              ) {
+                dimensions {
+                  databaseId
+                }
+                max {
+                  databaseSizeBytes
+                }
+              }
+              r2OperationGroups: r2OperationsAdaptiveGroups(
+                filter: { datetime_geq: $start, datetime_lt: $end }
+                limit: 100
+              ) {
+                dimensions {
+                  actionType
+                }
+                sum {
+                  requests
+                }
+              }
+              r2StorageGroups: r2StorageAdaptiveGroups(
+                filter: { datetime_geq: $start, datetime_lt: $end }
+                limit: 100
+              ) {
+                max {
+                  metadataSize
+                  payloadSize
                 }
               }
             }
           }
-        `,
-        {
-          accountTag: env.accountId,
-          end: window.windowEnd,
-          start: window.periodStart,
-        },
-      );
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-
-      process.stderr.write(
-        `[warn] GraphQL pricing collection failed; sending empty pricing inputs: ${message}\n`,
-      );
-
-      return [];
-    }
+        }
+      `,
+      {
+        accountTag: env.accountId,
+        end: window.windowEnd,
+        start: window.periodStart,
+      },
+    );
 
     const account = data.viewer.accounts[0];
 
@@ -588,10 +605,15 @@ export function createCloudflareCollector(
         (sum, group) => sum + Number(group.sum?.requests ?? 0),
         0,
       ) ?? 0;
+    const pagesFunctionsRequests =
+      account.pagesFunctionsGroups?.reduce(
+        (sum, group) => sum + Number(group.sum?.requests ?? 0),
+        0,
+      ) ?? 0;
     const d1ByDatabase = new Map<string, { rowsRead: number; rowsWritten: number; storageGbMonths: number }>();
 
     for (const group of account.d1UsageGroups ?? []) {
-      const name = group.dimensions?.databaseName;
+      const name = group.dimensions?.databaseId;
 
       if (!name) {
         continue;
@@ -605,7 +627,7 @@ export function createCloudflareCollector(
     }
 
     for (const group of account.d1StorageGroups ?? []) {
-      const name = group.dimensions?.databaseName;
+      const name = group.dimensions?.databaseId;
 
       if (!name) {
         continue;
@@ -649,7 +671,7 @@ export function createCloudflareCollector(
       {
         includedRequests: 0,
         kind: "pages-functions",
-        requests: 0,
+        requests: pagesFunctionsRequests,
         usdPerMillionRequests: DEFAULT_PRICING.pagesFunctions.usdPerMillionRequests,
       },
       {
@@ -675,8 +697,148 @@ export function createCloudflareCollector(
     return pricingInputs;
   }
 
+  async function collectWorkerRequests(timestamp: string): Promise<number> {
+    const now = normalizeTimestamp(timestamp).toISOString();
+    const dayStart = getUtcDayStart(timestamp);
+
+    const data = await graphql<{
+      viewer: {
+        accounts: Array<{
+          pagesFunctionsGroups?: Array<{ sum?: { requests?: number | null } }>;
+          workerGroups?: Array<{ sum?: { requests?: number | null } }>;
+        }>;
+      };
+    }>(
+      `
+        query BillingShieldWorkerRequests($accountTag: string!, $start: Time!, $end: Time!) {
+          viewer {
+            accounts(filter: { accountTag: $accountTag }) {
+              workerGroups: workersInvocationsAdaptive(
+                limit: 288
+                filter: { datetime_geq: $start, datetime_lt: $end }
+              ) {
+                sum {
+                  requests
+                }
+              }
+              pagesFunctionsGroups: pagesFunctionsInvocationsAdaptiveGroups(
+                limit: 288
+                filter: { datetime_geq: $start, datetime_lt: $end }
+              ) {
+                sum {
+                  requests
+                }
+              }
+            }
+          }
+        }
+      `,
+      {
+        accountTag: env.accountId,
+        end: now,
+        start: dayStart,
+      },
+    );
+
+    const account = data.viewer.accounts[0];
+
+    if (!account) {
+      return 0;
+    }
+
+    const workersRequests =
+      account.workerGroups?.reduce((sum, group) => sum + Number(group.sum?.requests ?? 0), 0) ?? 0;
+    const pagesFunctionsRequests =
+      account.pagesFunctionsGroups?.reduce((sum, group) => sum + Number(group.sum?.requests ?? 0), 0) ?? 0;
+
+    return workersRequests + pagesFunctionsRequests;
+  }
+
+  async function collectResourceUsageTotals(timestamp: string): Promise<ResourceUsageTotals> {
+    const now = normalizeTimestamp(timestamp).toISOString();
+    const dayStart = getUtcDayStart(timestamp);
+
+    const data = await graphql<{
+      viewer: {
+        accounts: Array<{
+          d1UsageGroups?: Array<{
+            sum?: { rowsRead?: number | null; rowsWritten?: number | null };
+          }>;
+          pagesFunctionsGroups?: Array<{ sum?: { requests?: number | null } }>;
+          r2OperationGroups?: Array<{ sum?: { requests?: number | null } }>;
+        }>;
+      };
+    }>(
+      `
+        query BillingShieldResourceUsage($accountTag: string!, $start: Time!, $end: Time!) {
+          viewer {
+            accounts(filter: { accountTag: $accountTag }) {
+              pagesFunctionsGroups: pagesFunctionsInvocationsAdaptiveGroups(
+                limit: 288
+                filter: { datetime_geq: $start, datetime_lt: $end }
+              ) {
+                sum {
+                  requests
+                }
+              }
+              d1UsageGroups: d1AnalyticsAdaptiveGroups(
+                filter: { datetimeFiveMinutes_geq: $start, datetimeFiveMinutes_lt: $end }
+                limit: 288
+              ) {
+                sum {
+                  rowsRead
+                  rowsWritten
+                }
+              }
+              r2OperationGroups: r2OperationsAdaptiveGroups(
+                filter: { datetime_geq: $start, datetime_lt: $end }
+                limit: 288
+              ) {
+                sum {
+                  requests
+                }
+              }
+            }
+          }
+        }
+      `,
+      {
+        accountTag: env.accountId,
+        end: now,
+        start: dayStart,
+      },
+    );
+    const account = data.viewer.accounts[0];
+
+    if (!account) {
+      return {
+        d1RowsUsed: 0,
+        pagesFunctionsRequests: 0,
+        r2OperationsUsed: 0,
+      };
+    }
+
+    const pagesFunctionsRequests =
+      account.pagesFunctionsGroups?.reduce((sum, group) => sum + Number(group.sum?.requests ?? 0), 0) ?? 0;
+    const d1RowsUsed =
+      account.d1UsageGroups?.reduce(
+        (sum, group) => sum + Number(group.sum?.rowsRead ?? 0) + Number(group.sum?.rowsWritten ?? 0),
+        0,
+      ) ?? 0;
+    const r2OperationsUsed =
+      account.r2OperationGroups?.reduce((sum, group) => sum + Number(group.sum?.requests ?? 0), 0) ?? 0;
+
+    return {
+      d1RowsUsed,
+      pagesFunctionsRequests,
+      r2OperationsUsed,
+    };
+  }
+
   return {
     collectPricingInputs,
+    collectResourceUsageTotals,
+    collectWorkerRequests,
     listCurrentResources: async () => {
       const [workers, r2] = await Promise.all([listWorkers(), listR2Buckets()]);
 
