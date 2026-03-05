@@ -462,8 +462,7 @@ export function createCloudflareCollector(
 
   async function collectPricingInputs(timestamp: string): Promise<PricingInput[]> {
     const window = getCollectionWindow(timestamp);
-
-    const data = await graphql<{
+    let data: {
       viewer: {
         accounts: Array<{
           d1StorageGroups?: Array<{
@@ -484,66 +483,99 @@ export function createCloudflareCollector(
           workerGroups?: Array<{ sum?: { requests?: number | null } }>;
         }>;
       };
-    }>(
-      `
-        query BillingShieldWindow($accountTag: string!, $start: Time!, $end: Time!) {
-          viewer {
-            accounts(filter: { accountTag: $accountTag }) {
-              workerGroups: workersInvocationsAdaptive(
-                limit: 1
-                filter: { datetime_geq: $start, datetime_lt: $end }
-              ) {
-                sum {
-                  requests
+    };
+
+    try {
+      data = await graphql<{
+        viewer: {
+          accounts: Array<{
+            d1StorageGroups?: Array<{
+              dimensions?: { databaseName?: string };
+              max?: { databaseSizeBytes?: number | null };
+            }>;
+            d1UsageGroups?: Array<{
+              dimensions?: { databaseName?: string };
+              sum?: { rowsRead?: number | null; rowsWritten?: number | null };
+            }>;
+            r2OperationGroups?: Array<{
+              dimensions?: { actionType?: string | null };
+              sum?: { requests?: number | null };
+            }>;
+            r2StorageGroups?: Array<{
+              max?: { metadataSize?: number | null; payloadSize?: number | null };
+            }>;
+            workerGroups?: Array<{ sum?: { requests?: number | null } }>;
+          }>;
+        };
+      }>(
+        `
+          query BillingShieldWindow($accountTag: string!, $start: Time!, $end: Time!) {
+            viewer {
+              accounts(filter: { accountTag: $accountTag }) {
+                workerGroups: workersInvocationsAdaptive(
+                  limit: 1
+                  filter: { datetime_geq: $start, datetime_lt: $end }
+                ) {
+                  sum {
+                    requests
+                  }
                 }
-              }
-              d1UsageGroups: d1AnalyticsAdaptiveGroups(
-                filter: { datetime_geq: $start, datetime_lt: $end }
-                limit: 100
-              ) {
-                dimensions {
-                  databaseName
+                d1UsageGroups: d1AnalyticsAdaptiveGroups(
+                  filter: { datetime_geq: $start, datetime_lt: $end }
+                  limit: 100
+                ) {
+                  dimensions {
+                    databaseName
+                  }
+                  sum {
+                    rowsRead
+                    rowsWritten
+                  }
                 }
-                sum {
-                  rowsRead
-                  rowsWritten
+                d1StorageGroups: d1StorageAdaptiveGroups(limit: 100) {
+                  dimensions {
+                    databaseName
+                  }
+                  max {
+                    databaseSizeBytes
+                  }
                 }
-              }
-              d1StorageGroups: d1StorageAdaptiveGroups(limit: 100) {
-                dimensions {
-                  databaseName
+                r2OperationGroups: r2OperationsAdaptiveGroups(
+                  filter: { datetime_geq: $start, datetime_lt: $end }
+                  limit: 100
+                ) {
+                  dimensions {
+                    actionType
+                  }
+                  sum {
+                    requests
+                  }
                 }
-                max {
-                  databaseSizeBytes
-                }
-              }
-              r2OperationGroups: r2OperationsAdaptiveGroups(
-                filter: { datetime_geq: $start, datetime_lt: $end }
-                limit: 100
-              ) {
-                dimensions {
-                  actionType
-                }
-                sum {
-                  requests
-                }
-              }
-              r2StorageGroups: r2StorageAdaptiveGroups(limit: 100) {
-                max {
-                  metadataSize
-                  payloadSize
+                r2StorageGroups: r2StorageAdaptiveGroups(limit: 100) {
+                  max {
+                    metadataSize
+                    payloadSize
+                  }
                 }
               }
             }
           }
-        }
-      `,
-      {
-        accountTag: env.accountId,
-        end: window.windowEnd,
-        start: window.periodStart,
-      },
-    );
+        `,
+        {
+          accountTag: env.accountId,
+          end: window.windowEnd,
+          start: window.periodStart,
+        },
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+
+      process.stderr.write(
+        `[warn] GraphQL pricing collection failed; sending empty pricing inputs: ${message}\n`,
+      );
+
+      return [];
+    }
 
     const account = data.viewer.accounts[0];
 

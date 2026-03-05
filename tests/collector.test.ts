@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { runCollector, shouldRunFullInventory } from "../src/collector";
+import { createCloudflareCollector, runCollector, shouldRunFullInventory } from "../src/collector";
 
 function getRequestInit(fetchMock: ReturnType<typeof vi.fn>): RequestInit {
   const call = fetchMock.mock.calls[0] as [RequestInfo | URL, RequestInit?] | undefined;
@@ -168,5 +168,41 @@ describe("scheduler cadence", () => {
     expect(snapshotStore.save).toHaveBeenCalledWith([
       { id: "r2:assets", type: "r2" },
     ]);
+  });
+
+  it("falls back to empty pricing inputs when GraphQL analytics filters are unsupported", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === "https://api.cloudflare.com/client/v4/graphql") {
+        return new Response(
+          JSON.stringify({
+            data: null,
+            errors: [
+              {
+                message:
+                  'error parsing args for "d1AnalyticsAdaptiveGroups": filter: unknown arg datetime_lt',
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+
+      throw new Error(`Unexpected URL: ${String(input)}`);
+    });
+    const collector = createCloudflareCollector(
+      {
+        accountId: "account-id",
+        apiToken: "api-token",
+        ingestUrl: "https://private.example.com/api/ingest",
+        serviceTokenId: "token-id",
+        serviceTokenSecret: "token-secret",
+      },
+      fetchMock as typeof fetch,
+    );
+
+    const pricingInputs = await collector.collectPricingInputs("2026-03-05T10:50:00Z");
+
+    expect(pricingInputs).toEqual([]);
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 });
