@@ -255,8 +255,34 @@ function classifyR2Operation(action: string | null | undefined): "a" | "b" {
   return "b";
 }
 
-async function parseJsonResponse<T>(response: Response): Promise<T> {
-  return (await response.json()) as T;
+interface ParseJsonResponseOptions {
+  allowEmpty?: boolean;
+  context: string;
+}
+
+async function parseJsonResponse<T>(
+  response: Response,
+  options: ParseJsonResponseOptions,
+): Promise<T | null> {
+  const raw = await response.text();
+
+  if (raw.trim() === "") {
+    if (options.allowEmpty) {
+      return null;
+    }
+
+    throw new Error(`${options.context}: empty JSON response (status ${response.status})`);
+  }
+
+  try {
+    return JSON.parse(raw) as T;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const preview = raw.replace(/\s+/g, " ").slice(0, 160);
+    throw new Error(
+      `${options.context}: invalid JSON response (status ${response.status}): ${message}; body-preview="${preview}"`,
+    );
+  }
 }
 
 export function shouldRunFullInventory(timestamp: string): boolean {
@@ -393,7 +419,11 @@ export async function runCollector(
     },
     method: "POST",
   });
-  const body = await parseJsonResponse<IngestResponseBody>(response);
+  const body =
+    (await parseJsonResponse<IngestResponseBody>(response, {
+      allowEmpty: true,
+      context: `ingest ${dependencies.ingest.url}`,
+    })) ?? { ok: true };
 
   if (!response.ok || body.ok !== true) {
     throw new Error(
@@ -419,7 +449,13 @@ export function createCloudflareCollector(
       ...init,
       headers,
     });
-    const payload = await parseJsonResponse<CloudflareApiResponse<T>>(response);
+    const payload = await parseJsonResponse<CloudflareApiResponse<T>>(response, {
+      context: `cloudflare ${path}`,
+    });
+
+    if (!payload) {
+      throw new Error(`cloudflare ${path}: empty JSON payload`);
+    }
 
     if (!response.ok || !payload.success) {
       const message =
@@ -448,7 +484,13 @@ export function createCloudflareCollector(
     const payload = await parseJsonResponse<{
       data?: T;
       errors?: Array<{ message: string }>;
-    }>(response);
+    }>(response, {
+      context: "cloudflare graphql",
+    });
+
+    if (!payload) {
+      throw new Error("cloudflare graphql: empty JSON payload");
+    }
 
     if (!response.ok || payload.errors?.length) {
       throw new Error(payload.errors?.map((error) => error.message).join(", ") ?? "graphql_failed");

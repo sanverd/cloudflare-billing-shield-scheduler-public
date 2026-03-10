@@ -222,4 +222,30 @@ describe("scheduler cadence", () => {
       { id: "r2:assets", type: "r2" },
     ]);
   });
+
+  it("accepts a successful ingest response with an empty body", async () => {
+    const fetchMock = vi.fn(async () => new Response(null, { status: 202 }));
+
+    const result = await runCollector("2026-03-03T10:07:00Z", {
+      cloudflare: {
+        collectPricingInputs: vi.fn(async () => []),
+        collectResourceUsageTotals: vi.fn(async () => ({
+          d1RowsUsed: 0,
+          pagesFunctionsRequests: 0,
+          r2OperationsUsed: 0,
+        })),
+        collectWorkerRequests: vi.fn(async () => 0),
+        listCurrentResources: vi.fn(async () => []),
+        reconcileInventory: vi.fn(async () => []),
+      },
+      fetchFn: fetchMock,
+      ingest: {
+        serviceTokenId: "token-id",
+        serviceTokenSecret: "token-secret",
+        url: "https://private.example.com/api/ingest",
+      },
+    });
+
+    expect(result.response.ok).toBe(true);
+  });
 });
