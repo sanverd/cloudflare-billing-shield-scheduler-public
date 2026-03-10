@@ -1,5 +1,8 @@
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { runCollector, shouldRunFullInventory } from "../src/collector";
+import { createFileSnapshotStore, runCollector, shouldRunFullInventory } from "../src/collector";
 
 function getRequestInit(fetchMock: ReturnType<typeof vi.fn>): RequestInit {
   const call = fetchMock.mock.calls[0] as [RequestInfo | URL, RequestInit?] | undefined;
@@ -19,6 +22,24 @@ function createSnapshotStore(initial: Array<{ id: string; type: "d1" | "pages" |
 }
 
 describe("scheduler cadence", () => {
+  it("treats an empty snapshot cache file as an empty inventory", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "collector-cache-empty-"));
+    const snapshotFile = path.join(directory, "inventory-snapshot.json");
+    await writeFile(snapshotFile, "", "utf8");
+    const store = createFileSnapshotStore(snapshotFile);
+
+    await expect(store.load()).resolves.toEqual([]);
+  });
+
+  it("treats a truncated snapshot cache file as an empty inventory", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "collector-cache-truncated-"));
+    const snapshotFile = path.join(directory, "inventory-snapshot.json");
+    await writeFile(snapshotFile, "{", "utf8");
+    const store = createFileSnapshotStore(snapshotFile);
+
+    await expect(store.load()).resolves.toEqual([]);
+  });
+
   it("runs full inventory only at the top of the hour", () => {
     expect(shouldRunFullInventory("2026-03-03T10:00:00Z")).toBe(true);
     expect(shouldRunFullInventory("2026-03-03T10:05:00Z")).toBe(false);

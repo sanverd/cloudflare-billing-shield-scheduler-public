@@ -35,9 +35,33 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .state
-          key: collector-snapshot-${{ github.ref_name }}-${{ github.run_id }}
+          key: collector-snapshot-v2-${{ github.ref_name }}-${{ github.run_id }}
           restore-keys: |
-            collector-snapshot-${{ github.ref_name }}-
+            collector-snapshot-v2-${{ github.ref_name }}-
+
+      - name: Sanitize lightweight inventory snapshot
+        run: |
+          mkdir -p .state
+          if [ ! -f .state/inventory-snapshot.json ]; then
+            exit 0
+          fi
+          node -e '
+            const fs = require("node:fs");
+            const file = ".state/inventory-snapshot.json";
+            const raw = fs.readFileSync(file, "utf8");
+            if (raw.trim() === "") {
+              fs.writeFileSync(file, "[]\n", "utf8");
+              process.exit(0);
+            }
+            try {
+              const parsed = JSON.parse(raw);
+              if (!Array.isArray(parsed)) {
+                fs.writeFileSync(file, "[]\n", "utf8");
+              }
+            } catch {
+              fs.writeFileSync(file, "[]\n", "utf8");
+            }
+          '
 
       - name: Run collector
         env:
@@ -49,8 +73,8 @@ jobs:
         run: npm run start
 
       - name: Save lightweight inventory snapshot
-        if: always()
+        if: success()
         uses: actions/cache/save@v4
         with:
           path: .state
-          key: collector-snapshot-${{ github.ref_name }}-${{ github.run_id }}
+          key: collector-snapshot-v2-${{ github.ref_name }}-${{ github.run_id }}

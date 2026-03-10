@@ -303,7 +303,18 @@ export function createFileSnapshotStore(filePath: string): SnapshotStore {
     load: async () => {
       try {
         const content = await readFile(filePath, "utf8");
-        const parsed = JSON.parse(content) as unknown;
+
+        if (content.trim() === "") {
+          return [];
+        }
+
+        let parsed: unknown;
+
+        try {
+          parsed = JSON.parse(content) as unknown;
+        } catch {
+          return [];
+        }
 
         if (!Array.isArray(parsed)) {
           return [];
